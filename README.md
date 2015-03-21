@@ -1,0 +1,2 @@
+# laravelhybridauth
+Laravel HybridAuth interface
