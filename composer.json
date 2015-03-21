@@ -16,5 +16,7 @@
             "Jacob1237\\LaravelHybridAuth": "src/"
         }
     },
-    "minimum-stability": "stable"
+    "minimum-stability": "stable",
+    "license": "MIT",
+    "version": "1.0"
 }
