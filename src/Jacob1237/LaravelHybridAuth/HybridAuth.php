@@ -279,12 +279,7 @@ class HybridAuth
      */
     protected function applyAdapterProfileToExistingProfile($adapter_profile, $profile)
     {
-        $attributes = get_object_vars($adapter_profile);
-
-        foreach ($attributes as $key => $value) {
-            $profile->setAttribute($key, $value);
-        }
-
+        $profile->fill(get_object_vars($adapter_profile));
         return $profile;
     }
 }
