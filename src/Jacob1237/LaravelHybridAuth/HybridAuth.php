@@ -5,7 +5,9 @@ namespace Jacob1237\LaravelHybridAuth;
 use Hybrid_Auth;
 use Hybrid_Provider_Adapter;
 use Hybrid_User_Profile;
+use Illuminate\Support\FacadesLog;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Session;
 
 
 class HybridAuth
@@ -29,7 +31,7 @@ class HybridAuth
      *
      * @var Hybrid_User_Profile
      */
-    protected $adapter_profile;
+    protected $adapterProfile;
 
     /**
      * The name of the current provider, e.g. Facebook, LinkedIn, etc
@@ -39,39 +41,24 @@ class HybridAuth
     protected $provider;
 
     /**
+     * User profile
+     *
+     * @var \Profile
+     */
+    protected $profile = null;
+
+    /**
      * Create a new Social instance
      *
      * @param array $config
      */
-    public function __construct(array $config)
+    public function __construct(array $config, Hybrid_Auth $hybridAuth)
     {
         $this->config = $config;
-    }
+        $this->hybridAuth = $hybridAuth;
 
-    /**
-     * Get a social profile for a user, optionally specifying which social network to get, and which user to query
-     */
-    public function getProfile($network = NULL, $user = NULL)
-    {
-        //if the supplied $user value is null, use the current user
-        if ($user === NULL) {
-            $user = Auth::user();
-
-            //if there is no current user, exit out
-            if (!$user) {
-                return NULL;
-            }
-        }
-
-        //if the provided network is null, grab the user's first existing social profile
-        if ($network === NULL) {
-            $profile = $user->profiles()->first();
-        } //otherwise get the specific social profile for this network
-        else {
-            $profile = $user->profiles()->where('network', $network)->first();
-        }
-
-        return $profile;
+        $this->provider = Session::get('SocialAuth::provider', null);
+        $this->adapterProfile = unserialize(Session::get('SocialAuth::profile', null));
     }
 
     /**
@@ -84,7 +71,7 @@ class HybridAuth
         $haconfig = $this->config['hybridauth'];
         $providers = array();
 
-        //iterate over the social providers in the config
+        // Iterate over the social providers in the config
         foreach (array_get($haconfig, 'providers', array()) as $provider => $config) {
             if (array_get($config, 'enabled')) {
                 $providers[] = $provider;
@@ -135,26 +122,92 @@ class HybridAuth
     }
 
     /**
-     * Attempt to log in with a given provider
+     * Attempt authenticate
      *
-     * @param string $provider
-     * @param Hybrid_Auth $hybridauth
+     * If user profile is already exists, authorize him.
+     *
+     * If there is no profile, but user is already logged in,
+     * create new profile and append it to the current user.
+     *
+     * If there is no profile and no user, return false.
+     *
+     * @param $provider
+     * @throws \Exception
+     * @return bool
      */
-    public function attemptAuthentication($provider, Hybrid_Auth $hybridauth)
+    public function attempt($provider)
     {
-        $profile = NULL;
+        $adapter = null;
+        $this->provider = $provider;
 
         try {
-            $this->provider = $provider;
-            $adapter = $hybridauth->authenticate($provider);
+            $adapter = $this->hybridAuth->authenticate($provider);
 
-            $this->setAdapter($adapter);
-            $this->setAdapterProfile($adapter->getUserProfile());
-
-            $profile = $this->findProfile();
+            if (empty($adapter)) {
+                return false;
+            }
+        } catch(\Exception $e) {
+            Log::error('LaravelHybridAuth: ' . $e->getMessage());
+            throw new \Exception('Errors during social login', 1);
         }
-        catch (\Exception $e) {
-            \Log::error("LaravelHybridAuth: " . $e->getMessage());
+
+        $this->setAdapter($adapter);
+        $this->setAdapterProfile($adapter->getUserProfile());
+
+        $profile = $this->profile();
+
+        if ($profile) {
+            $this->updateProfile($profile);
+            Auth::loginUsingId($profile->user->getKey());
+        } elseif(Auth::check()) {
+            $this->createProfile(Auth::user());
+        } else {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Check if user is logged in
+     * through the social network
+     *
+     * @return bool
+     */
+    public function check()
+    {
+        return $this->adapterProfile ? true : false;
+    }
+
+    /**
+     * Logout from social accounts
+     */
+    public function logout()
+    {
+        $this->hybridAuth->logoutAllProviders();
+
+        Session::remove('SocialAuth::profile');
+        Session::remove('SocialAuth::provider');
+    }
+
+    /**
+     * Get profile
+     *
+     * @return bool
+     */
+    public function profile()
+    {
+        if (!empty($this->profile)) {
+            return $this->profile;
+        }
+
+        $profileModel = $this->config['db']['profilemodel'];
+        $profile = $profileModel::where('provider', $this->provider)
+            ->where('identifier', $this->adapterProfile->identifier)
+            ->first();
+
+        if ($profile) {
+            $this->profile = $profile;
         }
 
         return $profile;
@@ -167,7 +220,7 @@ class HybridAuth
      */
     public function getAdapterProfile()
     {
-        return $this->adapter_profile;
+        return $this->adapterProfile;
     }
 
     /**
@@ -177,109 +230,43 @@ class HybridAuth
      */
     public function setAdapterProfile(Hybrid_User_Profile $profile)
     {
-        $this->adapter_profile = $profile;
+        $this->adapterProfile = $profile;
+
+        Session::set('SocialAuth::provider', $this->provider);
+        Session::set('SocialAuth::profile', serialize($profile));
     }
 
     /**
-     * Finds a user's adapter profile
+     * Create new profile
      *
-     * @return mixed
+     * @param \Eloquent $user
+     * @return \Eloquent
      */
-    protected function findProfile()
+    public function createProfile($user)
     {
-        $adapter_profile = $this->getAdapterProfile();
+        $model = $this->config['db']['profilemodel'];;
 
-        $ProfileModel = $this->config['db']['profilemodel'];
-        $UserModel = $this->config['db']['usermodel'];
+        /** @var \Eloquent $profile */
+        $profile = new $model();
+        $profile->provider = $this->provider;
+        $profile->fill(get_object_vars($this->adapterProfile));
 
-        $user = NULL;
-
-        // Check if the provider profile already exists
-        $profile_builder = call_user_func_array(
-            "$ProfileModel::where",
-            array('provider', $this->provider)
-        );
-
-        // We found an existing user
-        if ($profile = $profile_builder->where('identifier', $adapter_profile->identifier)->first()) {
-            $user = $profile->user()->first();
-        } elseif ($adapter_profile->email) {
-            // It's a new profile, but it may not be a new user, so check the users by email
-            $user_builder = call_user_func_array(
-                "$UserModel::where",
-                array('email', $adapter_profile->email)
-            );
-
-            $user = $user_builder->first();
-        }
-
-        // If we haven't found a user, we need to create a new one
-        if (!$user) {
-            $user = new $UserModel();
-
-            // Map in anything from the profile that we want in the User
-            $map = $this->config['db']['profiletousermap'];
-            foreach ($map as $apkey => $ukey) {
-                $user->$ukey = $adapter_profile->$apkey;
-            }
-
-            // Setup additional user fields (according to db.php config)
-            $values = $this->config['db']['uservalues'];
-            foreach ($values as $key => $value) {
-                if (is_callable($value)) {
-                    $value = $value($user, $adapter_profile);
-                }
-
-                $user->setAttribute($key, $value);
-            }
-
-            if (!$user->save($this->config['db']['userrules'])) {
-                throw new \Exception('LaravelHybridAuth: Unable to save User model');
-            }
-        }
-
-        if (!$profile) {
-            $profile = $this->createProfileFromAdapterProfile($adapter_profile, $user);
-        } else {
-            $profile = $this->applyAdapterProfileToExistingProfile($adapter_profile, $profile);
-        }
-
-        if (!$profile->save()) {
-            throw new \Exception('LaravelHybridAuth: Unable to save Profile model');
-        }
+        $user->profiles()->save($profile);
 
         return $profile;
     }
 
     /**
-     * Creates a social profile from a HybridAuth adapter profile
+     * Update existent profile
      *
-     * @param \Hybrid_User_Profile $adapter_profile
-     * @param \User $user
-     * @return \Profile
+     * @param \Eloquent $profile
+     * @return \Eloquent
      */
-    protected function createProfileFromAdapterProfile($adapter_profile, $user)
+    public function updateProfile($profile)
     {
-        $ProfileModel = $this->config['db']['profilemodel'];
-        $foreignKey = $this->config['db']['profilesforeignkey'];
+        $profile->fill(get_object_vars($this->adapterProfile));
+        $profile->save();
 
-        $profile = new $ProfileModel();
-        $profile->provider = $this->provider;
-        $profile->setAttribute($foreignKey, $user->getKey());
-
-        return $this->applyAdapterProfileToExistingProfile($adapter_profile, $profile);
-    }
-
-    /**
-     * Saves an existing social profile with data from a HybridAuth adapter profile
-     *
-     * @param \Hybrid_User_Profile $adapter_profile
-     * @param \Profile $profile
-     * @return \Profile
-     */
-    protected function applyAdapterProfileToExistingProfile($adapter_profile, $profile)
-    {
-        $profile->fill(get_object_vars($adapter_profile));
         return $profile;
     }
 }
